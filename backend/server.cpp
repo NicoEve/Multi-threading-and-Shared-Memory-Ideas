@@ -169,8 +169,9 @@ bool sendWebSocketFrame(int socketFd, const std::string& message) {
 }
 
 // ============================================================================
-// DISEÑO 1: HILOS INDEPENDIENTES
-// Cada vehículo enemigo tiene su propio hilo de ejecución responsable de actualizarlo.
+// DISEÑO 2: HILO ÚNICO DE ACTUALIZACIÓN
+// En este diseño existe un solo hilo encargado de actualizar todos los vehículos.
+// A Thread ---> [Car1, Car2, ..., CarN]
 // ============================================================================
 
 struct EnemyCar {
@@ -180,8 +181,7 @@ struct EnemyCar {
     float x;
     float y;
     float speed;
-    std::atomic<bool> active;
-    std::thread workerThread;
+    bool active;
 
     EnemyCar(int id_, int type_, int lane_, float x_, float y_, float speed_)
         : id(id_), type(type_), laneIndex(lane_), x(x_), y(y_), speed(speed_), active(true) {}
@@ -196,31 +196,55 @@ std::atomic<bool> g_serverRunning{true};
 int g_clientSocket = -1;
 
 /**
- * Función que ejecuta el hilo independiente de cada vehículo enemigo.
- * Cada vehículo posee su propio hilo que actualiza su posición vertical periódicamente.
+ * DISEÑO 2: HILO ÚNICO DE ACTUALIZACIÓN
+ * Este único hilo es responsable de recorrer secuencialmente todos los vehículos
+ * y actualizar sus posiciones en cada ciclo de la simulación.
  */
-void carThreadWorker(std::shared_ptr<EnemyCar> car) {
-    std::cout << "[DISEÑO 1] Hilo CREADO -> Carro ID: " << car->id
-              << " | Carril: " << car->laneIndex 
-              << " | Velocidad: " << car->speed
-              << " | Thread ID: " << std::this_thread::get_id() << std::endl;
+void singleUpdateThreadWorker() {
+    std::cout << "[DISEÑO 2] Hilo Único de Actualización INICIADO (Thread ID: " 
+              << std::this_thread::get_id() << ")" << std::endl;
 
-    const int TICK_MS = 20; // Actualización a ~50 Hz
-    while (car->active && g_serverRunning) {
+    const int TICK_MS = 20; // 50 Hz (~20 ms)
+    int tickCounter = 0;
+
+    while (g_serverRunning) {
         std::this_thread::sleep_for(std::chrono::milliseconds(TICK_MS));
 
-        // Actualización individual de posición
-        car->y += car->speed;
+        int countUpdated = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_carsMutex);
 
-        // Comprobar si el vehículo salió de la pantalla inferior
-        if (car->y > GAME_HEIGHT + 60.0f) {
-            car->active = false;
-            break;
+            // Un único hilo recorre todos los vehículos y actualiza sus coordenadas
+            for (auto& car : g_activeCars) {
+                if (car->active) {
+                    car->y += car->speed;
+                    countUpdated++;
+
+                    if (car->y > GAME_HEIGHT + 60.0f) {
+                        car->active = false;
+                    }
+                }
+            }
+
+            // Limpieza de vehículos inactivos
+            auto it = g_activeCars.begin();
+            while (it != g_activeCars.end()) {
+                if (!(*it)->active) {
+                    it = g_activeCars.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // Registro en consola cada ~1 segundo si hay carros activos
+        if (++tickCounter % 50 == 0 && countUpdated > 0) {
+            std::cout << "[DISEÑO 2] Hilo Único (Thread ID: " << std::this_thread::get_id()
+                      << ") procesó secuencialmente " << countUpdated << " vehículos." << std::endl;
         }
     }
 
-    std::cout << "[DISEÑO 1] Hilo FINALIZADO -> Carro ID: " << car->id 
-              << " salió de pantalla (Thread ID: " << std::this_thread::get_id() << ")" << std::endl;
+    std::cout << "[DISEÑO 2] Hilo Único de Actualización FINALIZADO." << std::endl;
 }
 
 /**
@@ -241,7 +265,9 @@ bool isLaneFreeAtTop(int laneIdx) {
 }
 
 /**
- * Hilo generador (Spawner) que crea vehículos y lanza un hilo independiente para cada uno.
+ * Hilo generador (Spawner):
+ * Añade nuevos vehículos al vector compartido g_activeCars.
+ * Nótese que en el Diseño 2 NO se crea un hilo por carro; los carros son procesados por el Hilo Único.
  */
 void spawnerThreadWorker() {
     std::cout << "[SPAWNER] Hilo generador iniciado." << std::endl;
@@ -278,10 +304,12 @@ void spawnerThreadWorker() {
         {
             // Bloqueo de memoria compartida para registrar el vehículo
             std::lock_guard<std::mutex> lock(g_carsMutex);
-            // Iniciar el hilo independiente para este vehículo
-            newCar->workerThread = std::thread(carThreadWorker, newCar);
             g_activeCars.push_back(newCar);
         }
+
+        std::cout << "[SPAWNER] Carro ID: " << newCar->id 
+                  << " creado en carril " << newCar->laneIndex 
+                  << " (Delegado al Hilo Único de Actualización)" << std::endl;
 
         // Ajuste gradual de dificultad
         if (spawnDelayMs > 600) {
@@ -292,8 +320,7 @@ void spawnerThreadWorker() {
 
 /**
  * Hilo de transmisión (Broadcaster):
- * Recopila el estado de los vehículos actualizados por sus hilos independientes,
- * limpia los hilos terminados y envía el estado en JSON al frontend vía WebSocket.
+ * Recopila el estado de los vehículos en JSON y lo envía al frontend vía WebSocket.
  */
 void broadcasterThreadWorker() {
     std::cout << "[BROADCASTER] Hilo de transmisión iniciado." << std::endl;
@@ -304,29 +331,14 @@ void broadcasterThreadWorker() {
         if (g_clientSocket < 0) continue;
 
         std::string jsonPayload;
-        int activeThreadCount = 0;
+        int activeCarsCount = 0;
 
         {
             std::lock_guard<std::mutex> lock(g_carsMutex);
+            activeCarsCount = static_cast<int>(g_activeCars.size());
 
-            // 1. Limpieza de hilos que hayan finalizado (Reaper de memoria)
-            auto it = g_activeCars.begin();
-            while (it != g_activeCars.end()) {
-                if (!(*it)->active) {
-                    if ((*it)->workerThread.joinable()) {
-                        (*it)->workerThread.join(); // Esperar terminación limpia del hilo
-                    }
-                    it = g_activeCars.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-
-            activeThreadCount = static_cast<int>(g_activeCars.size());
-
-            // 2. Construcción de mensaje JSON con las posiciones calculadas por cada hilo
             std::ostringstream ss;
-            ss << "{\"design\":\"Diseño 1: Hilos Independientes\",\"threads\":" << activeThreadCount << ",\"cars\":[";
+            ss << "{\"design\":\"Diseño 2: Hilo Único de Actualización\",\"threads\":1,\"cars\":[";
             for (size_t i = 0; i < g_activeCars.size(); ++i) {
                 const auto& car = g_activeCars[i];
                 ss << "{\"id\":" << car->id
@@ -341,7 +353,7 @@ void broadcasterThreadWorker() {
             jsonPayload = ss.str();
         }
 
-        // 3. Envío seguro por el socket
+        // Envío seguro por el socket
         {
             std::lock_guard<std::mutex> sockLock(g_socketMutex);
             if (g_clientSocket >= 0) {
@@ -411,7 +423,7 @@ int main() {
 
     std::cout << "=====================================================" << std::endl;
     std::cout << "  MICRO-PROYECTO 1 - PROGRAMACIÓN PARALELA" << std::endl;
-    std::cout << "  DISEÑO 1: HILOS INDEPENDIENTES POR VEHÍCULO" << std::endl;
+    std::cout << "  DISEÑO 2: HILO ÚNICO DE ACTUALIZACIÓN" << std::endl;
     std::cout << "=====================================================" << std::endl;
 
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
@@ -442,8 +454,12 @@ int main() {
 
     std::cout << "[SERVIDOR] Escuchando en puerto " << PORT << "..." << std::endl;
 
-    // Iniciar hilos maestros: generador (spawner) y transmisor (broadcaster)
+    // Iniciar hilos del sistema:
+    // 1. Spawner: genera carros y los agrega a la lista compartida.
+    // 2. SingleUpdateThread: EL HILO ÚNICO encargado de actualizar todos los vehículos.
+    // 3. Broadcaster: transmite las posiciones por WebSocket.
     std::thread spawnerThread(spawnerThreadWorker);
+    std::thread singleUpdateThread(singleUpdateThreadWorker);
     std::thread broadcasterThread(broadcasterThreadWorker);
 
     // Bucle principal de aceptación de clientes
@@ -498,6 +514,7 @@ int main() {
 
     g_serverRunning = false;
     if (spawnerThread.joinable()) spawnerThread.join();
+    if (singleUpdateThread.joinable()) singleUpdateThread.join();
     if (broadcasterThread.joinable()) broadcasterThread.join();
     close(serverFd);
 
