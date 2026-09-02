@@ -545,6 +545,59 @@ window.onload = function () {
     enemySpeedText.text = getEnemySpeedText(enemySpeed);
     msToReleaseText.text = getMsToReleaseText(msToReleaseEnemy);
 
+    // Integración con el Backend C++ Concurrente
+    if (window.gameNetwork) {
+      window.gameNetwork.addListener((data) => {
+        if (!gameStarted || lost) return;
+        if (!data || !data.cars) return;
+
+        const currentBackendCars = data.cars;
+        const currentIds = new Set(currentBackendCars.map(c => c.id));
+
+        // 1. Sincronizar o instanciar los carros generados por los hilos del backend
+        for (const bCar of currentBackendCars) {
+          let existing = enemyCars.find(c => c.carId === bCar.id);
+          if (!existing) {
+            existing = new EnemyCar(
+              app,
+              scenario.xRoadStart,
+              scenario.xRoadEnd,
+              windowHeight,
+              GameConfig.GAME_SPEED,
+              bCar.type
+            );
+            existing.carId = bCar.id;
+            existing.nearMissTriggered = false;
+            existing.pointsAwarded = false;
+            existing.popupShown = false;
+            existing.setPosition(bCar.x, bCar.y);
+            enemyCars.push(existing);
+            app.stage.addChild(existing.sprite);
+          } else {
+            existing.setPosition(bCar.x, bCar.y);
+          }
+        }
+
+        // 2. Limpiar carros que el hilo del backend finalizó (salieron de pantalla)
+        for (let i = enemyCars.length - 1; i >= 0; i--) {
+          const car = enemyCars[i];
+          if (car.carId && !currentIds.has(car.carId)) {
+            app.stage.removeChild(car.sprite);
+            carsEvadedCount++;
+            if (!car.pointsAwarded) {
+              car.pointsAwarded = true;
+              score += 1;
+              scoreText.text = getScoreText(score);
+              if (!car.popupShown) {
+                audioManager.playScore();
+              }
+            }
+            enemyCars.splice(i, 1);
+          }
+        }
+      });
+    }
+
     // Function to check if a position is clear of enemy cars
     function isPositionClearOfEnemies(x, y, safeDistance = 80) {
       for (let i = 0; i < enemyCars.length; i++) {
@@ -904,7 +957,8 @@ window.onload = function () {
         scenario.animate();
 
         // Check if is time to add an enemy car to the game and increase difficulty
-        if ((now - startTime) >= msToReleaseEnemy) {
+        const isBackendActive = window.gameNetwork && window.gameNetwork.isConnected;
+        if (!isBackendActive && (now - startTime) >= msToReleaseEnemy) {
           startTime = now;
 
           const enemyCar = new EnemyCar(
@@ -1173,7 +1227,10 @@ window.onload = function () {
 
           // Move car if still in visible area, otherwise remove it
           if ((enemyBounds.y - car.height) < windowHeight) {
-            car.y += currentEnemySpeed;
+            const isDrivenByBackend = window.gameNetwork && window.gameNetwork.isConnected && enemyCars[i].carId;
+            if (!isDrivenByBackend) {
+              car.y += currentEnemySpeed;
+            }
 
             // Refresh bounds after movement
             enemyBounds = car.getBounds();
