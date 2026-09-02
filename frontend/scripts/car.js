@@ -56,19 +56,19 @@ class Car {
  * Randomly selects a sprite and spawns at specified lane positions
  */
 class EnemyCar extends Car {
-  constructor(app, boundLeft, boundRight, boundBottom, speed) {
-    // Get a random enemy sprite
-    const texture = app.loader.resources[`enemy${randomBetween(1, 5)}`].texture;
+  constructor(app, boundLeft, boundRight, boundBottom, speed, type = null) {
+    // Get specified or random enemy sprite
+    const enemyType = (type && type >= 1 && type <= 5) ? type : randomBetween(1, 5);
+    const texture = app.loader.resources[`enemy${enemyType}`].texture;
     super(app, texture, boundLeft, boundRight, boundBottom, speed);
+    this.carId = null;
+    this.carType = enemyType;
   }
 
   invoke(lanesQ, lanesPosition) {
-    // const whichLane = randomBetween(1, lanesQ);  // Randomly select a lane
-    // const laneToPushEnemy = lanesPosition[whichLane - 1]; // Get the position of the selected lane
-    // this.setPosition(laneToPushEnemy.x, -this.sprite.height);
-
-    this.setPosition(290, -30); // Set a fixed position for testing purposes
-    
+    const whichLane = randomBetween(1, lanesQ);  // Randomly select a lane
+    const laneToPushEnemy = lanesPosition[whichLane - 1]; // Get the position of the selected lane
+    this.setPosition(laneToPushEnemy.x, -this.sprite.height);
   }
 }
 
