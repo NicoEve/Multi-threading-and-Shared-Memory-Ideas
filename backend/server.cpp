@@ -368,12 +368,25 @@ bool handleWebSocketHandshake(int clientFd) {
     std::string keyHeader = "Sec-WebSocket-Key: ";
     size_t keyPos = request.find(keyHeader);
     if (keyPos == std::string::npos) {
+        keyHeader = "sec-websocket-key: ";
+        keyPos = request.find(keyHeader);
+    }
+    if (keyPos == std::string::npos) {
+        keyHeader = "Sec-WebSocket-Key:";
+        keyPos = request.find(keyHeader);
+    }
+    if (keyPos == std::string::npos) {
         std::cerr << "[HTTP] Petición no contiene Sec-WebSocket-Key." << std::endl;
         return false;
     }
 
     size_t keyEnd = request.find("\r\n", keyPos);
+    if (keyEnd == std::string::npos) keyEnd = request.find("\n", keyPos);
+    if (keyEnd == std::string::npos) keyEnd = request.length();
+
     std::string clientKey = request.substr(keyPos + keyHeader.length(), keyEnd - (keyPos + keyHeader.length()));
+    while (!clientKey.empty() && (clientKey.back() == ' ' || clientKey.back() == '\r')) clientKey.pop_back();
+    while (!clientKey.empty() && clientKey.front() == ' ') clientKey.erase(0, 1);
 
     std::string acceptKey = computeWebSocketAcceptKey(clientKey);
 

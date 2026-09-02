@@ -66,7 +66,10 @@ class GameNetwork {
   }
 
   connect() {
-    const host = window.location.hostname || 'localhost';
+    // Usar 127.0.0.1 para evitar problemas de resolución IPv6 (::1) en Windows
+    const host = (window.location.hostname === 'localhost' || !window.location.hostname) 
+      ? '127.0.0.1' 
+      : window.location.hostname;
     const wsUrl = `ws://${host}:5000`;
     console.log(`[NETWORK] Conectando a ${wsUrl}...`);
 
