@@ -23,6 +23,9 @@
 // Coordenadas X de los 6 carriles posibles (calculados exactamente como en el frontend)
 const int LANE_POSITIONS[6] = { 160, 224, 288, 352, 416, 480 };
 const int TOTAL_LANES = 6;
+const int NUM_CAR_TYPES = 5;
+
+const char* TYPE_NAMES[6] = { "", "Rojo", "Azul", "Verde", "Rosa", "Blanco" };
 
 // ============================================================================
 // Utilidades Criptográficas y de Red para WebSocket RFC 6455
@@ -169,9 +172,10 @@ bool sendWebSocketFrame(int socketFd, const std::string& message) {
 }
 
 // ============================================================================
-// DISEÑO 2: HILO ÚNICO DE ACTUALIZACIÓN
-// En este diseño existe un solo hilo encargado de actualizar todos los vehículos.
-// A Thread ---> [Car1, Car2, ..., CarN]
+// DISEÑO 3: HILO PARA CADA TIPO DE VEHÍCULO
+// En este diseño existe un solo hilo encargado de actualizar todos los vehículos
+// de un tipo (rojos, azules, verdes, rosas, blancos).
+// A Thread ---> Car(red), Car2(red), ..., CarN(red)
 // ============================================================================
 
 struct EnemyCar {
@@ -187,38 +191,40 @@ struct EnemyCar {
         : id(id_), type(type_), laneIndex(lane_), x(x_), y(y_), speed(speed_), active(true) {}
 };
 
-// Variables compartidas entre hilos (Memoria Compartida)
-std::vector<std::shared_ptr<EnemyCar>> g_activeCars;
-std::mutex g_carsMutex;          // Protege la lista de vehículos activos
+// Variables compartidas particionadas por tipo (Descomposición por Dominio)
+std::vector<std::shared_ptr<EnemyCar>> g_carsByType[NUM_CAR_TYPES + 1]; // Índices 1 a 5
+std::mutex g_typeMutex[NUM_CAR_TYPES + 1];                               // Cerrojo independiente por tipo
+
 std::mutex g_socketMutex;        // Protege el socket contra escrituras simultáneas
 std::atomic<int> g_nextCarId{1};
 std::atomic<bool> g_serverRunning{true};
 int g_clientSocket = -1;
 
 /**
- * DISEÑO 2: HILO ÚNICO DE ACTUALIZACIÓN
- * Este único hilo es responsable de recorrer secuencialmente todos los vehículos
- * y actualizar sus posiciones en cada ciclo de la simulación.
+ * DISEÑO 3: HILO POR TIPO DE VEHÍCULO
+ * Cada uno de los 5 hilos es responsable exclusivamente de actualizar
+ * los vehículos de su tipo correspondiente.
  */
-void singleUpdateThreadWorker() {
-    std::cout << "[DISEÑO 2] Hilo Único de Actualización INICIADO (Thread ID: " 
-              << std::this_thread::get_id() << ")" << std::endl;
+void typeUpdateThreadWorker(int carType) {
+    std::cout << "[DISEÑO 3] Hilo Tipo " << carType << " (" << TYPE_NAMES[carType]
+              << ") INICIADO (Thread ID: " << std::this_thread::get_id() << ")" << std::endl;
 
-    const int TICK_MS = 20; // 50 Hz (~20 ms)
+    const int TICK_MS = 20; // 50 Hz
     int tickCounter = 0;
 
     while (g_serverRunning) {
         std::this_thread::sleep_for(std::chrono::milliseconds(TICK_MS));
 
-        int countUpdated = 0;
+        int updatedCount = 0;
         {
-            std::lock_guard<std::mutex> lock(g_carsMutex);
+            // Bloqueo de grano fino: solo bloquea los carros de su tipo,
+            // permitiendo que los otros tipos se ejecuten en paralelo real en otros núcleos.
+            std::lock_guard<std::mutex> lock(g_typeMutex[carType]);
 
-            // Un único hilo recorre todos los vehículos y actualiza sus coordenadas
-            for (auto& car : g_activeCars) {
+            for (auto& car : g_carsByType[carType]) {
                 if (car->active) {
                     car->y += car->speed;
-                    countUpdated++;
+                    updatedCount++;
 
                     if (car->y > GAME_HEIGHT + 60.0f) {
                         car->active = false;
@@ -226,38 +232,40 @@ void singleUpdateThreadWorker() {
                 }
             }
 
-            // Limpieza de vehículos inactivos
-            auto it = g_activeCars.begin();
-            while (it != g_activeCars.end()) {
+            // Limpieza de vehículos inactivos de este tipo
+            auto it = g_carsByType[carType].begin();
+            while (it != g_carsByType[carType].end()) {
                 if (!(*it)->active) {
-                    it = g_activeCars.erase(it);
+                    it = g_carsByType[carType].erase(it);
                 } else {
                     ++it;
                 }
             }
         }
 
-        // Registro en consola cada ~1 segundo si hay carros activos
-        if (++tickCounter % 50 == 0 && countUpdated > 0) {
-            std::cout << "[DISEÑO 2] Hilo Único (Thread ID: " << std::this_thread::get_id()
-                      << ") procesó secuencialmente " << countUpdated << " vehículos." << std::endl;
+        // Registro periódico en consola
+        if (++tickCounter % 50 == 0 && updatedCount > 0) {
+            std::cout << "[DISEÑO 3] Hilo Tipo " << carType << " (" << TYPE_NAMES[carType]
+                      << ", Thread ID: " << std::this_thread::get_id()
+                      << ") procesó " << updatedCount << " vehículos." << std::endl;
         }
     }
 
-    std::cout << "[DISEÑO 2] Hilo Único de Actualización FINALIZADO." << std::endl;
+    std::cout << "[DISEÑO 3] Hilo Tipo " << carType << " (" << TYPE_NAMES[carType] << ") FINALIZADO." << std::endl;
 }
 
 /**
- * Verifica si un carril está disponible en la zona superior para evitar colisiones
- * entre enemigos al momento del spawn ("no hay colisión entre enemigos").
+ * Verifica si un carril está disponible en la zona superior considerando
+ * todos los tipos de vehículos, para evitar colisiones entre enemigos en el spawn.
  */
 bool isLaneFreeAtTop(int laneIdx) {
-    std::lock_guard<std::mutex> lock(g_carsMutex);
-    for (const auto& car : g_activeCars) {
-        if (car->active && car->laneIndex == laneIdx) {
-            // Si hay un carro activo en este carril y aún no se ha alejado lo suficiente:
-            if (car->y < 180.0f) {
-                return false;
+    for (int t = 1; t <= NUM_CAR_TYPES; t++) {
+        std::lock_guard<std::mutex> lock(g_typeMutex[t]);
+        for (const auto& car : g_carsByType[t]) {
+            if (car->active && car->laneIndex == laneIdx) {
+                if (car->y < 180.0f) {
+                    return false;
+                }
             }
         }
     }
@@ -266,8 +274,7 @@ bool isLaneFreeAtTop(int laneIdx) {
 
 /**
  * Hilo generador (Spawner):
- * Añade nuevos vehículos al vector compartido g_activeCars.
- * Nótese que en el Diseño 2 NO se crea un hilo por carro; los carros son procesados por el Hilo Único.
+ * Añade nuevos vehículos al vector del tipo correspondiente.
  */
 void spawnerThreadWorker() {
     std::cout << "[SPAWNER] Hilo generador iniciado." << std::endl;
@@ -276,7 +283,6 @@ void spawnerThreadWorker() {
     while (g_serverRunning) {
         std::this_thread::sleep_for(std::chrono::milliseconds(spawnDelayMs));
 
-        // Solo generar carros si hay un cliente conectado
         if (g_clientSocket < 0) continue;
 
         // Buscar carriles disponibles
@@ -288,12 +294,11 @@ void spawnerThreadWorker() {
         }
 
         if (availableLanes.empty()) {
-            continue; // Ningún carril despejado en la parte superior
+            continue;
         }
 
-        // Seleccionar aleatoriamente un carril libre
         int selectedLane = availableLanes[rand() % availableLanes.size()];
-        int carType = (rand() % 5) + 1; // Sprites 1 a 5
+        int carType = (rand() % NUM_CAR_TYPES) + 1; // Tipo 1 a 5
         float speed = 2.5f + static_cast<float>(rand() % 25) / 10.0f; // 2.5 a 4.9
         float startX = static_cast<float>(LANE_POSITIONS[selectedLane]);
         float startY = -60.0f;
@@ -302,16 +307,15 @@ void spawnerThreadWorker() {
         auto newCar = std::make_shared<EnemyCar>(newId, carType, selectedLane, startX, startY, speed);
 
         {
-            // Bloqueo de memoria compartida para registrar el vehículo
-            std::lock_guard<std::mutex> lock(g_carsMutex);
-            g_activeCars.push_back(newCar);
+            // Bloquea únicamente el mutex del tipo asignado
+            std::lock_guard<std::mutex> lock(g_typeMutex[carType]);
+            g_carsByType[carType].push_back(newCar);
         }
 
         std::cout << "[SPAWNER] Carro ID: " << newCar->id 
-                  << " creado en carril " << newCar->laneIndex 
-                  << " (Delegado al Hilo Único de Actualización)" << std::endl;
+                  << " (Tipo: " << TYPE_NAMES[carType] << ") creado en carril " << newCar->laneIndex 
+                  << " -> Asignado al Hilo Tipo " << carType << std::endl;
 
-        // Ajuste gradual de dificultad
         if (spawnDelayMs > 600) {
             spawnDelayMs -= 5;
         }
@@ -320,7 +324,7 @@ void spawnerThreadWorker() {
 
 /**
  * Hilo de transmisión (Broadcaster):
- * Recopila el estado de los vehículos en JSON y lo envía al frontend vía WebSocket.
+ * Recopila los vehículos de todos los tipos y los envía por WebSocket al frontend.
  */
 void broadcasterThreadWorker() {
     std::cout << "[BROADCASTER] Hilo de transmisión iniciado." << std::endl;
@@ -330,28 +334,32 @@ void broadcasterThreadWorker() {
 
         if (g_clientSocket < 0) continue;
 
-        std::string jsonPayload;
-        int activeCarsCount = 0;
+        std::vector<std::shared_ptr<EnemyCar>> allCars;
 
-        {
-            std::lock_guard<std::mutex> lock(g_carsMutex);
-            activeCarsCount = static_cast<int>(g_activeCars.size());
-
-            std::ostringstream ss;
-            ss << "{\"design\":\"Diseño 2: Hilo Único de Actualización\",\"threads\":1,\"cars\":[";
-            for (size_t i = 0; i < g_activeCars.size(); ++i) {
-                const auto& car = g_activeCars[i];
-                ss << "{\"id\":" << car->id
-                   << ",\"type\":" << car->type
-                   << ",\"lane\":" << car->laneIndex
-                   << ",\"x\":" << car->x
-                   << ",\"y\":" << car->y
-                   << ",\"speed\":" << car->speed << "}";
-                if (i + 1 < g_activeCars.size()) ss << ",";
+        // Recolectar carros de los 5 tipos de forma segura
+        for (int t = 1; t <= NUM_CAR_TYPES; t++) {
+            std::lock_guard<std::mutex> lock(g_typeMutex[t]);
+            for (const auto& car : g_carsByType[t]) {
+                if (car->active) {
+                    allCars.push_back(car);
+                }
             }
-            ss << "]}";
-            jsonPayload = ss.str();
         }
+
+        std::ostringstream ss;
+        ss << "{\"design\":\"Diseño 3: Hilos por Tipo de Vehículo\",\"threads\":5,\"cars\":[";
+        for (size_t i = 0; i < allCars.size(); ++i) {
+            const auto& car = allCars[i];
+            ss << "{\"id\":" << car->id
+               << ",\"type\":" << car->type
+               << ",\"lane\":" << car->laneIndex
+               << ",\"x\":" << car->x
+               << ",\"y\":" << car->y
+               << ",\"speed\":" << car->speed << "}";
+            if (i + 1 < allCars.size()) ss << ",";
+        }
+        ss << "]}";
+        std::string jsonPayload = ss.str();
 
         // Envío seguro por el socket
         {
@@ -423,7 +431,7 @@ int main() {
 
     std::cout << "=====================================================" << std::endl;
     std::cout << "  MICRO-PROYECTO 1 - PROGRAMACIÓN PARALELA" << std::endl;
-    std::cout << "  DISEÑO 2: HILO ÚNICO DE ACTUALIZACIÓN" << std::endl;
+    std::cout << "  DISEÑO 3: HILO PARA CADA TIPO DE VEHÍCULO" << std::endl;
     std::cout << "=====================================================" << std::endl;
 
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
@@ -454,12 +462,14 @@ int main() {
 
     std::cout << "[SERVIDOR] Escuchando en puerto " << PORT << "..." << std::endl;
 
-    // Iniciar hilos del sistema:
-    // 1. Spawner: genera carros y los agrega a la lista compartida.
-    // 2. SingleUpdateThread: EL HILO ÚNICO encargado de actualizar todos los vehículos.
-    // 3. Broadcaster: transmite las posiciones por WebSocket.
+    // Iniciar los 5 hilos de tipo (uno por cada color de vehículo)
+    std::vector<std::thread> typeThreads;
+    for (int t = 1; t <= NUM_CAR_TYPES; t++) {
+        typeThreads.emplace_back(typeUpdateThreadWorker, t);
+    }
+
+    // Iniciar hilos maestros de generación y transmisión
     std::thread spawnerThread(spawnerThreadWorker);
-    std::thread singleUpdateThread(singleUpdateThreadWorker);
     std::thread broadcasterThread(broadcasterThreadWorker);
 
     // Bucle principal de aceptación de clientes
@@ -485,7 +495,6 @@ int main() {
                 g_clientSocket = newClientFd;
             }
 
-            // Mantener la conexión abierta leyendo tramas del cliente (o detectar desconexión)
             uint8_t inBuffer[1024];
             while (g_serverRunning) {
                 ssize_t n = recv(newClientFd, inBuffer, sizeof(inBuffer), 0);
@@ -493,7 +502,6 @@ int main() {
                     std::cout << "[CLIENTE] Conexión cerrada por el cliente." << std::endl;
                     break;
                 }
-                // Si el opcode es 0x8 (Close frame)
                 if ((inBuffer[0] & 0x0F) == 0x08) {
                     std::cout << "[CLIENTE] Trama de cierre recibida." << std::endl;
                     break;
@@ -513,8 +521,10 @@ int main() {
     }
 
     g_serverRunning = false;
+    for (auto& th : typeThreads) {
+        if (th.joinable()) th.join();
+    }
     if (spawnerThread.joinable()) spawnerThread.join();
-    if (singleUpdateThread.joinable()) singleUpdateThread.join();
     if (broadcasterThread.joinable()) broadcasterThread.join();
     close(serverFd);
 
